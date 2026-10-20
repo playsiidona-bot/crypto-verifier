@@ -8,6 +8,8 @@ const { ethers } = require('ethers');
 const { Connection, PublicKey, Keypair } = require('@solana/web3.js');
 const { WalletContractV4, TonClient, Address, fromNano } = require('@ton/ton');
 const { mnemonicToPrivateKey } = require('@ton/crypto');
+const fs = require('fs');
+const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
@@ -15,7 +17,43 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-// --- Configuration & Environment ---
+// File path for persistent storage
+const DATA_FILE = path.join(__dirname, 'accounts_data.json');
+
+// In-Memory Storage (with file persistence)
+const userAccounts = new Map(); // Telegram User ID -> User Account
+const invoices = new Map();     // Order ID -> Invoice
+
+// Load saved accounts from file on startup
+function loadPersistedData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, 'utf-8');
+      const data = JSON.parse(raw);
+      if (Array.isArray(data)) {
+        for (const user of data) {
+          userAccounts.set(user.userId, user);
+        }
+        console.log(`💾 Loaded ${userAccounts.size} persistent accounts from disk.`);
+      }
+    }
+  } catch (err) {
+    console.error('Data load note:', err.message);
+  }
+}
+
+// Save accounts to file
+function savePersistedData() {
+  try {
+    const list = Array.from(userAccounts.values());
+    fs.writeFileSync(DATA_FILE, JSON.stringify(list, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Data save note:', err.message);
+  }
+}
+
+// Initial load
+loadPersistedData();
 const PORT = process.env.PORT || 3000;
 const APP_URL = (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
 const MASTER_MNEMONIC = process.env.MASTER_MNEMONIC || "test test test test test test test test test test test junk";
@@ -114,6 +152,7 @@ async function getOrCreateUserAccount(userId, username = 'User') {
   };
 
   userAccounts.set(userId, userAccount);
+  savePersistedData();
   return userAccount;
 }
 
@@ -257,6 +296,7 @@ function handleSuccessfulDeposit(user, amount, network, address) {
     time: new Date(),
     address
   });
+  savePersistedData();
 
   console.log(`🎉 [Payment Verified] User ${user.username} (${user.userId}) sent $${amount} on ${network}!`);
 
