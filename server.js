@@ -48,22 +48,28 @@ const invoices = new Map();
 
 // --- 1. Address Derivation Engine (Unique Address per Order) ---
 function getEvmAddress(orderIndex) {
-  const hdNode = ethers.HDNodeWallet.fromPhrase(MASTER_MNEMONIC);
-  const derived = hdNode.derivePath(`m/44'/60'/0'/0/${orderIndex}`);
-  return derived.address;
+  const cleanMnemonic = MASTER_MNEMONIC.trim().replace(/\s+/g, ' ');
+  const wallet = ethers.HDNodeWallet.fromPhrase(
+    cleanMnemonic,
+    undefined,
+    `m/44'/60'/0'/0/${orderIndex}`
+  );
+  return wallet.address;
 }
 
 async function getSolanaAddress(orderIndex) {
-  const seed = await bip39.mnemonicToSeed(MASTER_MNEMONIC);
+  const cleanMnemonic = MASTER_MNEMONIC.trim().replace(/\s+/g, ' ');
+  const seed = await bip39.mnemonicToSeed(cleanMnemonic);
   const path = `m/44'/501'/${orderIndex}'/0'`;
   const derived = derivePath(path, seed.toString('hex')).key;
-  const { Keypair } = require('@solana/web3.js');
   const keypair = Keypair.fromSeed(derived);
   return keypair.publicKey.toBase58();
 }
 
 async function getTonAddress(orderIndex) {
-  const keyPair = await mnemonicToPrivateKey(MASTER_MNEMONIC.trim().split(/\s+/));
+  const cleanMnemonic = MASTER_MNEMONIC.trim().replace(/\s+/g, ' ');
+  const words = cleanMnemonic.split(' ');
+  const keyPair = await mnemonicToPrivateKey(words);
   const wallet = WalletContractV4.create({
     workchain: 0,
     publicKey: keyPair.publicKey,
