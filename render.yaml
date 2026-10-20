@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: crypto-auto-verifier
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: APP_URL
+        sync: false
+      - key: MASTER_MNEMONIC
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ADMIN_CHAT_ID
+        sync: false
+      - key: POLYGON_RPC_URL
+        value: https://polygon-rpc.com
+      - key: BSC_RPC_URL
+        value: https://bsc-dataseed.binance.org
+      - key: SOLANA_RPC_URL
+        value: https://api.mainnet-beta.solana.com
+      - key: TON_API_URL
+        value: https://toncenter.com/api/v2/jsonRPC
+      - key: INVOICE_EXPIRY_MINUTES
+        value: 60
+      - key: WATCHER_INTERVAL_SECONDS
+        value: 10
