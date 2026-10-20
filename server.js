@@ -22,7 +22,7 @@ const MASTER_MNEMONIC = process.env.MASTER_MNEMONIC || "test test test test test
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || "";
 
-const POLYGON_RPC = process.env.POLYGON_RPC_URL || "https://polygon-rpc.com";
+const POLYGON_RPC = process.env.POLYGON_RPC_URL || "https://polygon-bor-rpc.publicnode.com";
 const BSC_RPC = process.env.BSC_RPC_URL || "https://bsc-dataseed.binance.org";
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const TON_RPC = process.env.TON_API_URL || "https://toncenter.com/api/v2/jsonRPC";
