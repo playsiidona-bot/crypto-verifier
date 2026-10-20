@@ -27,7 +27,6 @@ const BSC_RPC = process.env.BSC_RPC_URL || "https://bsc-dataseed.binance.org";
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const TON_RPC = process.env.TON_API_URL || "https://toncenter.com/api/v2/jsonRPC";
 const TON_API_KEY = process.env.TON_API_KEY || "";
-const INVOICE_EXPIRY_MINUTES = parseInt(process.env.INVOICE_EXPIRY_MINUTES || "60", 10);
 const WATCHER_INTERVAL_MS = (parseInt(process.env.WATCHER_INTERVAL_SECONDS || "10", 10)) * 1000;
 
 // Token Contract Addresses (USDT)
@@ -43,10 +42,11 @@ const tonClient = new TonClient({ endpoint: TON_RPC, apiKey: TON_API_KEY });
 
 const ERC20_ABI = ["function balanceOf(address owner) view returns (uint256)"];
 
-// Database for active Invoices
-const invoices = new Map();
+// In-Memory Storage
+const userAccounts = new Map(); // Telegram User ID -> User Account
+const invoices = new Map();     // Order ID -> Invoice
 
-// --- 1. Address Derivation Engine (Unique Address per Order) ---
+// --- 1. Address Derivation Engine (Unique Address per User / Order) ---
 function getEvmAddress(orderIndex) {
   const cleanMnemonic = MASTER_MNEMONIC.trim().replace(/\s+/g, ' ');
   const wallet = ethers.HDNodeWallet.fromPhrase(
@@ -78,31 +78,43 @@ async function getTonAddress(orderIndex) {
   return wallet.address.toString({ bounceable: false });
 }
 
-async function createInvoiceData(orderId, amountUsd, callbackUrl = null) {
-  const orderIndex = parseInt(orderId, 10);
-  const [polygonAddress, solanaAddress, tonAddress] = await Promise.all([
-    getEvmAddress(orderIndex),
-    getSolanaAddress(orderIndex),
-    getTonAddress(orderIndex)
+// Get or create permanent unique deposit addresses for a Telegram User
+async function getOrCreateUserAccount(userId, username = 'User') {
+  if (userAccounts.has(userId)) {
+    return userAccounts.get(userId);
+  }
+
+  const userIndex = userAccounts.size + 101; // Sequential index starting at 101
+  const [polygonAddr, solanaAddr, tonAddr] = await Promise.all([
+    getEvmAddress(userIndex),
+    getSolanaAddress(userIndex),
+    getTonAddress(userIndex)
   ]);
 
-  const invoice = {
-    order_id: orderIndex,
-    amount_expected: parseFloat(amountUsd),
-    status: 'PENDING',
-    created_at: new Date(),
-    expires_at: new Date(Date.now() + INVOICE_EXPIRY_MINUTES * 60 * 1000),
-    callback_url: callbackUrl,
+  const userAccount = {
+    userId,
+    username,
+    userIndex,
+    createdAt: new Date(),
     addresses: {
-      polygon: polygonAddress,
-      bep20: polygonAddress,
-      solana: solanaAddress,
-      ton: tonAddress
-    }
+      polygon: polygonAddr,
+      bep20: polygonAddr,
+      solana: solanaAddr,
+      ton: tonAddr
+    },
+    // Track last verified balances to detect ANY incoming amount
+    lastBalances: {
+      polygon: 0,
+      bep20: 0,
+      solana: 0,
+      ton: 0
+    },
+    totalDeposited: 0,
+    depositHistory: []
   };
 
-  invoices.set(orderIndex, invoice);
-  return invoice;
+  userAccounts.set(userId, userAccount);
+  return userAccount;
 }
 
 // --- 2. Balance Verification Engine (Without TxHash) ---
@@ -149,18 +161,58 @@ async function checkTonBalance(address) {
   }
 }
 
-// --- 3. Background Auto-Verifier (Watcher Loop) ---
+// --- 3. Background Auto-Verifier (Checks Any Amount, Anytime) ---
 async function runAutoVerifier() {
-  const now = new Date();
+  // Check user permanent deposit addresses
+  for (const [userId, user] of userAccounts.entries()) {
+    try {
+      const [polygonBal, bscBal, solanaBal, tonBal] = await Promise.all([
+        checkPolygonUsdt(user.addresses.polygon),
+        checkBscUsdt(user.addresses.bep20),
+        checkSolanaUsdt(user.addresses.solana),
+        checkTonBalance(user.addresses.ton)
+      ]);
 
+      // Check Polygon USDT increase
+      if (polygonBal > user.lastBalances.polygon) {
+        const received = polygonBal - user.lastBalances.polygon;
+        user.lastBalances.polygon = polygonBal;
+        handleSuccessfulDeposit(user, received, 'Polygon (USDT)', user.addresses.polygon);
+      }
+
+      // Check BSC USDT increase
+      if (bscBal > user.lastBalances.bep20) {
+        const received = bscBal - user.lastBalances.bep20;
+        user.lastBalances.bep20 = bscBal;
+        handleSuccessfulDeposit(user, received, 'BSC BEP-20 (USDT)', user.addresses.bep20);
+      }
+
+      // Check Solana USDT increase
+      if (solanaBal > user.lastBalances.solana) {
+        const received = solanaBal - user.lastBalances.solana;
+        user.lastBalances.solana = solanaBal;
+        handleSuccessfulDeposit(user, received, 'Solana (USDT)', user.addresses.solana);
+      }
+
+      // Check TON coin increase
+      if (tonBal > user.lastBalances.ton) {
+        const received = tonBal - user.lastBalances.ton;
+        user.lastBalances.ton = tonBal;
+        handleSuccessfulDeposit(user, received, 'TON (Coin)', user.addresses.ton);
+      }
+    } catch (e) {
+      // Quiet fail
+    }
+  }
+
+  // Also check standard web invoices
+  const now = new Date();
   for (const [orderId, invoice] of invoices.entries()) {
     if (invoice.status !== 'PENDING') continue;
-
     if (now > invoice.expires_at) {
       invoice.status = 'EXPIRED';
       continue;
     }
-
     try {
       const [polygonBalance, bscBalance, solanaBalance, tonBalance] = await Promise.all([
         checkPolygonUsdt(invoice.addresses.polygon),
@@ -176,7 +228,7 @@ async function runAutoVerifier() {
         detectedNetwork = 'Polygon (USDT)';
         detectedAmount = polygonBalance;
       } else if (bscBalance >= invoice.amount_expected) {
-        detectedNetwork = 'BNB Smart Chain BEP20 (USDT)';
+        detectedNetwork = 'BSC BEP-20 (USDT)';
         detectedAmount = bscBalance;
       } else if (solanaBalance >= invoice.amount_expected) {
         detectedNetwork = 'Solana (USDT)';
@@ -191,439 +243,232 @@ async function runAutoVerifier() {
         invoice.paid_at = new Date();
         invoice.paid_network = detectedNetwork;
         invoice.paid_amount = detectedAmount;
-
-        console.log(`✅ [Payment Detected] Order #${orderId} paid ${detectedAmount} on ${detectedNetwork}!`);
-
-        // Send Telegram Instant Alert to Admin
-        sendTelegramPaymentAlert(invoice);
-
-        // Send Webhook callback if provided
-        if (invoice.callback_url) {
-          triggerWebhook(invoice);
-        }
       }
-    } catch (error) {
-      // Ignore network hiccup
-    }
+    } catch (err) {}
   }
 }
 
-async function triggerWebhook(invoice) {
-  try {
-    await axios.post(invoice.callback_url, {
-      event: 'PAYMENT_VERIFIED',
-      order_id: invoice.order_id,
-      status: invoice.status,
-      paid_network: invoice.paid_network,
-      paid_amount: invoice.paid_amount,
-      paid_at: invoice.paid_at
-    }, { timeout: 8000 });
-  } catch (err) {
-    console.error(`Webhook error for #${invoice.order_id}:`, err.message);
+// Action when ANY payment arrives at any time
+function handleSuccessfulDeposit(user, amount, network, address) {
+  user.totalDeposited += amount;
+  user.depositHistory.push({
+    amount,
+    network,
+    time: new Date(),
+    address
+  });
+
+  console.log(`🎉 [Payment Verified] User ${user.username} (${user.userId}) sent $${amount} on ${network}!`);
+
+  // 1. Notify the Customer in Telegram
+  if (bot && user.userId) {
+    const userMsg = `🎉 **ክፍያዎ ደርሷል! (Payment Received)**\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `💰 **የተከፈለ መጠን:** \`$${amount.toFixed(2)} USDT\`\n` +
+      `🌐 **ኔትወርክ:** \`${network}\`\n` +
+      `⏱️ **ሰዓት:** \`${new Date().toLocaleTimeString()}\`\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ *ክፍያዎ ያለ ምንም hash በራስ-ሰር ተረጋግጦ ወደ ሂሳብዎ ገብቷል! እናመሰግናለን።*`;
+
+    bot.sendMessage(user.userId, userMsg, { parse_mode: 'Markdown' }).catch(() => {});
+  }
+
+  // 2. Notify the Admin in Telegram
+  if (bot && TELEGRAM_ADMIN_CHAT_ID) {
+    const adminMsg = `💰 **አዲስ ክፍያ ደርሷል! (Deposit Alert)**\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 **ተጠቃሚ:** @${user.username || 'ያልታወቀ'} (ID: \`${user.userId}\`)\n` +
+      `💵 **መጠን:** \`$${amount.toFixed(2)} USDT\`\n` +
+      `🌐 **ኔትወርክ:** \`${network}\`\n` +
+      `📍 **የገባበት አድራሻ:** \`${address}\`\n` +
+      `⏱️ **ሰዓት:** \`${new Date().toLocaleTimeString()}\`\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ *ገንዘቡ በቀጥታ ወደ እርስዎ Trust Wallet ገብቷል!*`;
+
+    bot.sendMessage(TELEGRAM_ADMIN_CHAT_ID, adminMsg, { parse_mode: 'Markdown' }).catch(() => {});
   }
 }
 
 setInterval(runAutoVerifier, WATCHER_INTERVAL_MS);
 
-// --- 4. 🤖 Telegram Admin Bot Integration ---
+// --- 4. 🤖 Telegram Bot (Direct In-Chat Deposit Engine) ---
 let bot = null;
 
 if (TELEGRAM_BOT_TOKEN) {
   try {
     bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-    console.log("🤖 Telegram Admin Bot initialized successfully!");
+    console.log("🤖 Telegram Payment Bot initialized!");
 
     bot.on('polling_error', (error) => {
-      // Quiet harmless polling warnings
-      console.log('Telegram Polling note:', error.code || error.message);
+      console.log('Telegram note:', error.code || error.message);
     });
 
-    const adminKeyboard = {
+    const userKeyboard = {
       reply_markup: {
         keyboard: [
-          [{ text: '➕ አዲስ ደረሰኝ ($10)' }, { text: '➕ አዲስ ደረሰኝ ($25)' }],
-          [{ text: '📊 የክፍያዎች ሁኔታ (Stats)' }, { text: '⚙️ Service Health' }]
+          [{ text: '💳 የክፍያ አድራሻ አውጣ (Deposit)' }],
+          [{ text: '💰 የኔ ሂሳብ (My Balance)' }, { text: 'ℹ️ መመሪያ (Help)' }]
         ],
         resize_keyboard: true
       }
     };
 
     // /start command
-    bot.onText(/\/start/, (msg) => {
+    bot.onText(/\/start/, async (msg) => {
       const chatId = msg.chat.id;
-      const welcomeText = `👋 ሰላም የአስተዳዳሪ ፓነል (Admin Panel) እንኳን ደህና መጡ!\n\n` +
-        `ይህ ቦት የክሪፕቶ ክፍያዎችን በ **Solana, Polygon, BEP-20, እና TON** በራስ-ሰር ይከታተላል።\n\n` +
-        `📌 **የትእዛዝ ዝርዝር (Commands):**\n` +
-        `• \`/new <መጠን>\` - አዲስ የክፍያ ሊንክ ለማመንጨት (ለምሳሌ፡ \`/new 15\`)\n` +
-        `• \`/status <order_id>\` - የክፍያ ሁኔታን ለመፈተሽ (ለምሳሌ፡ \`/status 1001\`)\n` +
-        `• \`/stats\` - አጠቃላይ የክፍያ ስታቲስቲክስ ለማየት\n\n` +
-        `ከታች ያሉትን አዝራሮች በመጫን ወዲያውኑ መጠቀም ይችላሉ፡`;
-      bot.sendMessage(chatId, welcomeText, adminKeyboard);
+      const username = msg.from.username || msg.from.first_name || 'User';
+
+      // Pre-generate addresses for this user
+      await getOrCreateUserAccount(chatId, username);
+
+      const welcome = `👋 ሰላም ${username}፣ እንኳን ወደ ክሪፕቶ ክፍያ ቦት በደህና መጡ!\n\n` +
+        `እዚህ ቦት ላይ **የፈለጉትን የገንዘብ መጠን በፈለጉት ሰዓት** መላክ ይችላሉ።\n\n` +
+        `📌 **ዋና ዋና ጥቅሞች፡**\n` +
+        `• ምንም አይነት ድረ-ገጽ ወይም ሊንክ መክፈት አያስፈልግዎትም!\n` +
+        `• የግብይት ቁጥር (Tx Hash) መላክ አይጠበቅብዎትም፤ በራሱ ያረጋግጣል።\n` +
+        `• በ **Solana, Polygon, BEP-20 (BSC), እና TON** መቀበል ይችላሉ።\n\n` +
+        `የመክፈያ አድራሻዎን ለማግኘት ከታች ያለውን **"💳 የክፍያ አድራሻ አውጣ (Deposit)"** የሚለውን አዝራር ይጫኑ።`;
+
+      bot.sendMessage(chatId, welcome, userKeyboard);
     });
 
-    // Handle Quick Button presses
+    // Handle button clicks and text
     bot.on('message', async (msg) => {
       const chatId = msg.chat.id;
       const text = msg.text || '';
+      const username = msg.from.username || msg.from.first_name || 'User';
 
-      if (text.startsWith('/start') || text.startsWith('/new') || text.startsWith('/status') || text.startsWith('/stats')) {
-        return; // Handled by onText
-      }
+      if (text.startsWith('/start') || text.startsWith('/stats')) return;
 
-      if (text === '➕ አዲስ ደረሰኝ ($10)') {
-        await handleCreateOrderViaBot(chatId, 10.0);
-      } else if (text === '➕ አዲስ ደረሰኝ ($25)') {
-        await handleCreateOrderViaBot(chatId, 25.0);
-      } else if (text === '📊 የክፍያዎች ሁኔታ (Stats)') {
-        handleStatsViaBot(chatId);
-      } else if (text === '⚙️ Service Health') {
-        bot.sendMessage(chatId, `🟢 **Crypto Verifier Online!**\n\nActive Invoices: ${invoices.size}\nServer Time: ${new Date().toLocaleTimeString()}`, { parse_mode: 'Markdown' });
-      }
-    });
-
-    // /new <amount> command
-    bot.onText(/\/new\s*(\d+(\.\d+)?)/, async (msg, match) => {
-      const chatId = msg.chat.id;
-      const amount = parseFloat(match[1]);
-      await handleCreateOrderViaBot(chatId, amount);
-    });
-
-    // /status <order_id> command
-    bot.onText(/\/status\s*(\d+)/, (msg, match) => {
-      const chatId = msg.chat.id;
-      const orderId = parseInt(match[1], 10);
-      const invoice = invoices.get(orderId);
-
-      if (!invoice) {
-        return bot.sendMessage(chatId, `❌ ደረሰኝ #${orderId} አልተገኘም።`);
-      }
-
-      const statusEmoji = invoice.status === 'PAID' ? '✅ PAID' : invoice.status === 'PENDING' ? '⏳ PENDING' : '❌ EXPIRED';
-      const reply = `📦 **ደረሰኝ #${invoice.order_id}**\n` +
-        `💵 መጠን፡ $${invoice.amount_expected} USDT\n` +
-        `📊 ሁኔታ፡ **${statusEmoji}**\n` +
-        `🌐 የተከፈለበት፡ ${invoice.paid_network || 'አልተከፈለም'}\n` +
-        `🔗 Checkout Link:\n${APP_URL}/pay/${invoice.order_id}`;
-      bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
-    });
-
-    // /stats command
-    bot.onText(/\/stats/, (msg) => {
-      handleStatsViaBot(msg.chat.id);
-    });
-
-    async function handleCreateOrderViaBot(chatId, amount) {
-      try {
-        const orderId = Math.floor(1000 + Math.random() * 90000);
-        const invoice = await createInvoiceData(orderId, amount);
-        const checkoutUrl = `${APP_URL}/pay/${orderId}`;
-
-        const reply = `✅ **አዲስ የክፍያ ደረሰኝ ተዘጋጅቷል!**\n` +
+      if (text === '💳 የክፍያ አድራሻ አውጣ (Deposit)' || text === '/deposit' || text === '/pay') {
+        await sendDepositAddresses(chatId, username);
+      } else if (text === '💰 የኔ ሂሳብ (My Balance)' || text === '/balance') {
+        const user = await getOrCreateUserAccount(chatId, username);
+        const reply = `💰 **የእርስዎ የክፍያ ሂሳብ (Balance)**\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
-          `📦 **Order ID:** \`#${orderId}\`\n` +
-          `💵 **የክፍያ መጠን:** \`$${amount.toFixed(2)} USDT\`\n` +
-          `⏳ **የማብቂያ ጊዜ:** \`${INVOICE_EXPIRY_MINUTES} ደቂቃዎች\`\n\n` +
-          `🔗 **የደንበኛ መክፈያ ሊንክ (Checkout Link):**\n` +
-          `${checkoutUrl}\n` +
+          `💵 **አጠቃላይ የከፈሉት መጠን:** \`$${user.totalDeposited.toFixed(2)} USDT\`\n` +
+          `📦 **የክፍያዎች ብዛት:** ${user.depositHistory.length}\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
-          `*(ይህንን ሊንክ ኮፒ አድርገው ለደንበኛዎ ይላኩ። ደንበኛው ክፍያውን ሲልክ ወዲያውኑ ማሳወቂያ ይደርስዎታል)*`;
+          `አዲስ ክፍያ ለመላክ "💳 የክፍያ አድራሻ አውጣ" የሚለውን ይጫኑ።`;
+        bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+      } else if (text === 'ℹ️ መመሪያ (Help)' || text === '/help') {
+        const help = `ℹ️ **ክፍያ እንዴት እንደሚፈጽሙ፡**\n\n` +
+          `1. "💳 የክፍያ አድራሻ አውጣ" የሚለውን ይጫኑ።\n` +
+          `2. የሚመጣውን አድራሻ በመንካት ኮፒ ያድርጉ (Tap to Copy)።\n` +
+          `3. ከዋሌትዎ (Binance, Bybit, Trust Wallet...) የፈለጉትን መጠን ይላኩ።\n` +
+          `4. ገንዘቡ እንደደረሰ ቦቱ በሰከንዶች ውስጥ "ክፍያዎ ደርሷል" የሚል ማረጋገጫ ይልክልዎታል። ምንም Hash መላክ አያስፈልግም!`;
+        bot.sendMessage(chatId, help);
+      }
+    });
 
-        bot.sendMessage(chatId, reply, {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '💳 የክፍያ ገጹን ክፈት (Open Checkout)', url: checkoutUrl }]
+    // Send Deposit Addresses DIRECTLY in Telegram (No external link!)
+    async function sendDepositAddresses(chatId, username) {
+      const user = await getOrCreateUserAccount(chatId, username);
+
+      const msg = `💳 **የእርስዎ ቋሚ የክፍያ አድራሻዎች (Deposit Addresses)**\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `📌 *የፈለጉትን መጠን በፈለጉት ሰዓት መላክ ይችላሉ። ክፍያው ሲገባ በሰከንዶች ውስጥ በራሱ ያረጋግጣል (ያለ Hash)*\n\n` +
+        `🟣 **Polygon (USDT / POL):**\n` +
+        `\`${user.addresses.polygon}\`\n` +
+        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n\n` +
+        `🟡 **BNB Smart Chain BEP-20 (USDT):**\n` +
+        `\`${user.addresses.bep20}\`\n` +
+        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n\n` +
+        `🟣 **Solana (USDT / SOL):**\n` +
+        `\`${user.addresses.solana}\`\n` +
+        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n\n` +
+        `💎 **TON (TON Coin):**\n` +
+        `\`${user.addresses.ton}\`\n` +
+        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `⚡ *ክፍያዎ እንደደረሰ ወዲያውኑ ማሳወቂያ ይደርስዎታል!*`;
+
+      bot.sendMessage(chatId, msg, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '📷 Polygon QR', callback_data: `qr_polygon_${chatId}` },
+              { text: '📷 Solana QR', callback_data: `qr_solana_${chatId}` }
+            ],
+            [
+              { text: '📷 BSC QR', callback_data: `qr_bep20_${chatId}` },
+              { text: '📷 TON QR', callback_data: `qr_ton_${chatId}` }
             ]
-          }
-        });
-      } catch (err) {
-        bot.sendMessage(chatId, `❌ ስህተት ተፈጥሯል፡ ${err.message}`);
-      }
+          ]
+        }
+      });
     }
 
-    function handleStatsViaBot(chatId) {
-      let paidCount = 0;
-      let pendingCount = 0;
-      let totalVolume = 0;
+    // QR Code callbacks
+    bot.on('callback_query', async (query) => {
+      const data = query.data;
+      const chatId = query.message.chat.id;
 
-      for (const inv of invoices.values()) {
-        if (inv.status === 'PAID') {
-          paidCount++;
-          totalVolume += (inv.paid_amount || inv.amount_expected);
-        } else if (inv.status === 'PENDING') {
-          pendingCount++;
+      if (data.startsWith('qr_')) {
+        const parts = data.split('_');
+        const net = parts[1];
+        const user = userAccounts.get(chatId);
+
+        if (user && user.addresses[net]) {
+          const addr = user.addresses[net];
+          const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(addr)}`;
+
+          bot.sendPhoto(chatId, qrUrl, {
+            caption: `📷 **${net.toUpperCase()} Deposit QR Code**\n\n\`${addr}\`\n\n*(ይህንን ስካን በማድረግ የፈለጉትን መጠን ይላኩ)*`,
+            parse_mode: 'Markdown'
+          });
         }
       }
+      bot.answerCallbackQuery(query.id);
+    });
 
-      const msg = `📊 **የክፍያዎች አጠቃላይ ሪፖርት (Stats)**\n` +
+    // Admin /stats command
+    bot.onText(/\/stats/, (msg) => {
+      if (String(msg.chat.id) !== String(TELEGRAM_ADMIN_CHAT_ID)) return;
+
+      let totalCollected = 0;
+      let totalTxCount = 0;
+
+      for (const u of userAccounts.values()) {
+        totalCollected += u.totalDeposited;
+        totalTxCount += u.depositHistory.length;
+      }
+
+      const report = `📊 **የአድሚን አጠቃላይ ሪፖርት (Stats)**\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
-        `✅ **የተከፈሉ ክፍያዎች:** ${paidCount}\n` +
-        `⏳ **በመጠባበቅ ላይ ያሉ:** ${pendingCount}\n` +
-        `💰 **አጠቃላይ ገቢ:** $${totalVolume.toFixed(2)} USDT\n` +
-        `📦 **አጠቃላይ ትዕዛዞች:** ${invoices.size}\n` +
+        `👥 **ጠቅላላ ተጠቃሚዎች:** ${userAccounts.size}\n` +
+        `✅ **የተሳኩ ክፍያዎች ብዛት:** ${totalTxCount}\n` +
+        `💰 **አጠቃላይ ገቢ:** \`$${totalCollected.toFixed(2)} USDT\`\n` +
         `━━━━━━━━━━━━━━━━━━━━`;
-      bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-    }
 
-  } catch (botErr) {
-    console.error("Telegram Bot initialization error:", botErr.message);
+      bot.sendMessage(msg.chat.id, report, { parse_mode: 'Markdown' });
+    });
+
+  } catch (err) {
+    console.error("Bot error:", err.message);
   }
 }
 
-// Function to send alert to admin when payment arrives
-function sendTelegramPaymentAlert(invoice) {
-  if (!bot) return;
-  const targetChatId = TELEGRAM_ADMIN_CHAT_ID;
-  if (!targetChatId) return;
-
-  const alertMsg = `🎉 **አዲስ ክፍያ በራስ-ሰር ተረጋግጧል! (Payment Verified)**\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `📦 **Order ID:** \`#${invoice.order_id}\`\n` +
-    `💰 **የተከፈለ መጠን:** \`$${invoice.paid_amount} USDT\`\n` +
-    `🌐 **ኔትወርክ:** \`${invoice.paid_network}\`\n` +
-    `⏱️ **ሰዓት:** \`${new Date().toLocaleTimeString()}\`\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `✅ *ደንበኛው ምንም TxHash ሳያስገባ ባክኢንዱ ክፍያውን አረጋግጧል። ገንዘቡ በቀጥታ ወደ ዋሌትዎ ገብቷል!*`;
-
-  bot.sendMessage(targetChatId, alertMsg, {
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🔍 ዝርዝሩን እይ (View Invoice)', url: `${APP_URL}/pay/${invoice.order_id}` }]
-      ]
-    }
-  }).catch(e => console.log('Telegram send alert error:', e.message));
-}
-
-// --- 5. Web Service Pages ---
+// --- 5. Web Service Routes (Health check & optional dashboard) ---
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date() });
+  res.json({ status: 'ok', users: userAccounts.size, time: new Date() });
 });
 
-// Admin Dashboard UI
 app.get('/', (req, res) => {
-  const invoiceList = Array.from(invoices.values()).reverse();
-  const rows = invoiceList.map(inv => `
-    <tr style="border-bottom: 1px solid #e2e8f0;">
-      <td style="padding: 12px; font-weight: bold;">#${inv.order_id}</td>
-      <td style="padding: 12px;">$${inv.amount_expected}</td>
-      <td style="padding: 12px;">
-        <span style="padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; 
-          background: ${inv.status === 'PAID' ? '#dcfce7; color: #166534;' : inv.status === 'PENDING' ? '#fef9c3; color: #854d0e;' : '#fee2e2; color: #991b1b;'}">
-          ${inv.status}
-        </span>
-      </td>
-      <td style="padding: 12px; font-size: 13px; color: #475569;">${inv.paid_network || '-'}</td>
-      <td style="padding: 12px;">
-        <a href="/pay/${inv.order_id}" target="_blank" style="color: #2563eb; text-decoration: none; font-weight: 600;">View Checkout &rarr;</a>
-      </td>
-    </tr>
-  `).join('');
-
   res.send(`
-    <!DOCTYPE html>
     <html>
-      <head>
-        <title>Crypto Payment Gateway - Admin Dashboard</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-      </head>
-      <body class="bg-gray-50 text-gray-800 p-4 md:p-10 font-sans">
-        <div class="max-w-5xl mx-auto space-y-6">
-          <div class="flex flex-col md:flex-row justify-between items-start md:items-center bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-            <div>
-              <h1 class="text-2xl font-bold text-gray-900">⚡ Crypto Payment Auto-Verifier</h1>
-              <p class="text-sm text-gray-500 mt-1">Solana, Polygon, BEP-20 (BSC), TON &bull; Unique Addresses &bull; Telegram Admin Bot</p>
-            </div>
-            <div class="mt-4 md:mt-0 flex items-center space-x-3">
-              <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                <span class="w-2 h-2 mr-2 bg-green-500 rounded-full animate-pulse"></span> Service Active
-              </span>
-              ${bot ? '<span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800">🤖 Bot Active</span>' : ''}
-            </div>
-          </div>
-
-          <!-- Create Order Form -->
-          <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-            <h2 class="text-lg font-bold text-gray-900 mb-4">➕ አዲስ የክፍያ ደረሰኝ ፍጠር (Create New Invoice)</h2>
-            <form action="/create-invoice-web" method="POST" class="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
-                <label class="block text-xs font-semibold text-gray-600 uppercase mb-1">Order ID</label>
-                <input type="number" name="order_id" required value="${Math.floor(1000 + Math.random() * 9000)}" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              </div>
-              <div>
-                <label class="block text-xs font-semibold text-gray-600 uppercase mb-1">Amount (USD / USDT)</label>
-                <input type="number" step="0.01" name="amount_usd" required value="10.00" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              </div>
-              <div class="flex items-end">
-                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg text-sm transition">
-                  Create Invoice & Checkout
-                </button>
-              </div>
-            </form>
-          </div>
-
-          <!-- Invoices Table -->
-          <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-            <div class="p-6 border-b border-gray-100">
-              <h2 class="text-lg font-bold text-gray-900">📋 የክፍያዎች ዝርዝር (Invoices)</h2>
-            </div>
-            <div class="overflow-x-auto">
-              <table class="w-full text-left text-sm">
-                <thead class="bg-gray-50 text-gray-500 uppercase text-xs">
-                  <tr>
-                    <th style="padding: 12px;">Order ID</th>
-                    <th style="padding: 12px;">Amount</th>
-                    <th style="padding: 12px;">Status</th>
-                    <th style="padding: 12px;">Network Paid</th>
-                    <th style="padding: 12px;">Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${rows || '<tr><td colspan="5" class="text-center py-8 text-gray-400">እስካሁን ምንም ደረሰኝ አልተፈጠረም። ከላይ አዲስ ይፍጠሩ።</td></tr>'}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+      <body style="font-family: sans-serif; padding: 40px; text-align: center;">
+        <h2>⚡ Telegram Crypto Payment Auto-Verifier</h2>
+        <p>Status: <b style="color: green;">ACTIVE</b></p>
+        <p>Active Users: <b>${userAccounts.size}</b></p>
+        <p>Connect with the bot directly on Telegram!</p>
       </body>
     </html>
   `);
-});
-
-app.post('/create-invoice-web', async (req, res) => {
-  const { order_id, amount_usd } = req.body;
-  await createInvoiceData(order_id, amount_usd);
-  res.redirect(`/pay/${order_id}`);
-});
-
-// Customer Checkout Page
-app.get('/pay/:order_id', (req, res) => {
-  const orderId = parseInt(req.params.order_id, 10);
-  const invoice = invoices.get(orderId);
-
-  if (!invoice) {
-    return res.status(404).send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px;">Invoice not found.</h2>');
-  }
-
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>Pay Invoice #${invoice.order_id}</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-        <script>
-          let currentTab = 'polygon';
-          const addresses = ${JSON.stringify(invoice.addresses)};
-
-          function selectTab(tab) {
-            currentTab = tab;
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('bg-blue-600', 'text-white'));
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.add('bg-gray-100', 'text-gray-700'));
-            
-            document.getElementById('tab-' + tab).classList.remove('bg-gray-100', 'text-gray-700');
-            document.getElementById('tab-' + tab).classList.add('bg-blue-600', 'text-white');
-
-            const addr = addresses[tab];
-            document.getElementById('display-address').innerText = addr;
-            document.getElementById('qr-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(addr);
-          }
-
-          function copyAddress() {
-            const addr = document.getElementById('display-address').innerText;
-            navigator.clipboard.writeText(addr);
-            const btn = document.getElementById('copy-btn');
-            btn.innerText = 'Copied! ✅';
-            setTimeout(() => { btn.innerText = 'Copy Address 📋'; }, 2000);
-          }
-
-          async function checkPaymentStatus() {
-            try {
-              const res = await fetch('/api/invoice/${invoice.order_id}');
-              const data = await res.json();
-              if (data.data && data.data.status === 'PAID') {
-                document.getElementById('payment-box').classList.add('hidden');
-                document.getElementById('success-box').classList.remove('hidden');
-              }
-            } catch (e) {}
-          }
-          setInterval(checkPaymentStatus, 4000);
-        </script>
-      </head>
-      <body class="bg-gray-100 min-h-screen flex items-center justify-center p-4 font-sans">
-        <div class="bg-white max-w-md w-full rounded-2xl shadow-xl overflow-hidden border border-gray-100">
-          <div class="bg-gradient-to-r from-blue-600 to-indigo-700 p-6 text-white text-center">
-            <h1 class="text-xl font-bold">Crypto Checkout</h1>
-            <p class="text-sm opacity-90 mt-1">Order #${invoice.order_id}</p>
-            <div class="mt-3 text-3xl font-extrabold">$${invoice.amount_expected.toFixed(2)} <span class="text-sm font-medium">USDT</span></div>
-          </div>
-
-          <div id="success-box" class="${invoice.status === 'PAID' ? '' : 'hidden'} p-8 text-center space-y-4">
-            <div class="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center mx-auto text-3xl">
-              ✓
-            </div>
-            <h2 class="text-2xl font-bold text-gray-900">ክፍያው ተረጋግጧል!</h2>
-            <p class="text-sm text-gray-600">Payment received and verified successfully!</p>
-            <p class="text-xs text-gray-400">Network: ${invoice.paid_network || 'Blockchain'}</p>
-            <a href="/" class="inline-block bg-gray-900 text-white px-6 py-2 rounded-lg text-sm font-medium hover:bg-gray-800">ወደ ዋናው ገጽ ተመለስ</a>
-          </div>
-
-          <div id="payment-box" class="${invoice.status === 'PAID' ? 'hidden' : ''} p-6 space-y-5">
-            <p class="text-xs text-center text-gray-500">ከታች ካሉት ኔትወርኮች አንዱን መርጠው ትክክለኛውን መጠን ይላኩ። ያለ hash በራሱ ያረጋግጣል።</p>
-
-            <div class="grid grid-cols-4 gap-1 bg-gray-50 p-1 rounded-xl">
-              <button id="tab-polygon" onclick="selectTab('polygon')" class="tab-btn py-2 text-xs font-semibold rounded-lg bg-blue-600 text-white transition">Polygon</button>
-              <button id="tab-bep20" onclick="selectTab('bep20')" class="tab-btn py-2 text-xs font-semibold rounded-lg bg-gray-100 text-gray-700 transition">BSC BEP20</button>
-              <button id="tab-solana" onclick="selectTab('solana')" class="tab-btn py-2 text-xs font-semibold rounded-lg bg-gray-100 text-gray-700 transition">Solana</button>
-              <button id="tab-ton" onclick="selectTab('ton')" class="tab-btn py-2 text-xs font-semibold rounded-lg bg-gray-100 text-gray-700 transition">TON</button>
-            </div>
-
-            <div class="flex justify-center py-2">
-              <div class="p-2 border border-gray-200 rounded-xl bg-white shadow-sm">
-                <img id="qr-img" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(invoice.addresses.polygon)}" class="w-44 h-44 object-contain">
-              </div>
-            </div>
-
-            <div class="space-y-2">
-              <label class="block text-xs font-semibold text-gray-500 uppercase text-center">Deposit Address (ልዩ አድራሻ)</label>
-              <div class="bg-gray-50 p-3 rounded-xl border border-gray-200 break-all text-xs font-mono text-center text-gray-800" id="display-address">
-                ${invoice.addresses.polygon}
-              </div>
-              <button id="copy-btn" onclick="copyAddress()" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-800 text-xs font-bold py-2.5 rounded-xl transition">
-                Copy Address 📋
-              </button>
-            </div>
-
-            <div class="flex items-center justify-center space-x-2 text-xs text-blue-600 font-medium pt-2">
-              <span class="w-2 h-2 bg-blue-500 rounded-full animate-ping"></span>
-              <span>ክፍያዎን በመጠባበቅ ላይ... (Auto-Checking)</span>
-            </div>
-          </div>
-        </div>
-      </body>
-    </html>
-  `);
-});
-
-// JSON API Routes
-app.post('/api/invoice/create', async (req, res) => {
-  try {
-    const { order_id, amount_usd, callback_url } = req.body;
-    const invoice = await createInvoiceData(order_id, amount_usd, callback_url);
-    res.json({ success: true, data: invoice });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/invoice/:order_id', (req, res) => {
-  const invoice = invoices.get(parseInt(req.params.order_id, 10));
-  if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
-  res.json({ success: true, data: invoice });
 });
 
 // Start Server
 app.listen(PORT, () => {
-  console.log(`🚀 Server started on port ${PORT}`);
+  console.log(`🚀 Crypto Verifier started on port ${PORT}`);
 });
