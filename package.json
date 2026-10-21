@@ -1,7 +1,7 @@
 {
   "name": "render-crypto-verifier",
   "version": "1.0.0",
-  "description": "Production-ready Multi-Chain Crypto Payment Auto-Verifier with Telegram Admin Bot for Render. Supports Solana, Polygon, BEP20, and TON with unique addresses without TxHash.",
+  "description": "Production-ready Unified Crypto (BEP20, Polygon) & Ethiopian Local Banks Payment Gateway for Render.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -19,7 +19,8 @@
     "ed25519-hd-key": "^1.3.0",
     "ethers": "^6.13.5",
     "express": "^4.21.2",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "qrcode": "^1.5.4"
   },
   "engines": {
     "node": ">=20.0.0"
