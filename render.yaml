@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: crypto-auto-verifier
+    name: crypto-verifier
     env: node
     plan: free
     buildCommand: npm install
@@ -18,15 +18,17 @@ services:
         sync: false
       - key: TELEGRAM_ADMIN_CHAT_ID
         sync: false
+      - key: TELEBIRR_PHONE
+        value: "09XXXXXXXX"
+      - key: CBE_ACCOUNT
+        value: "1000XXXXXXXXX"
+      - key: MERCHANT_NAME
+        value: "Merchant"
+      - key: USDT_TO_ETB_RATE
+        value: "130"
       - key: POLYGON_RPC_URL
-        value: https://polygon-rpc.com
+        value: https://polygon-bor-rpc.publicnode.com
       - key: BSC_RPC_URL
-        value: https://bsc-dataseed.binance.org
-      - key: SOLANA_RPC_URL
-        value: https://api.mainnet-beta.solana.com
-      - key: TON_API_URL
-        value: https://toncenter.com/api/v2/jsonRPC
-      - key: INVOICE_EXPIRY_MINUTES
-        value: 60
+        value: https://bsc-rpc.publicnode.com
       - key: WATCHER_INTERVAL_SECONDS
         value: 10

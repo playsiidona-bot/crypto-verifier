@@ -5,9 +5,6 @@ const axios = require('axios');
 const bip39 = require('bip39');
 const { derivePath } = require('ed25519-hd-key');
 const { ethers } = require('ethers');
-const { Connection, PublicKey, Keypair } = require('@solana/web3.js');
-const { WalletContractV4, TonClient, Address, fromNano } = require('@ton/ton');
-const { mnemonicToPrivateKey } = require('@ton/crypto');
 const fs = require('fs');
 const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
@@ -17,74 +14,78 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
+// --- Configuration & Environment ---
+const PORT = process.env.PORT || 3000;
+const APP_URL = (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
+const MASTER_MNEMONIC = process.env.MASTER_MNEMONIC || "test test test test test test test test test test test junk";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_ADMIN_CHAT_ID = (process.env.TELEGRAM_ADMIN_CHAT_ID || "").trim();
+
+// Local Banks (Ethiopian Birr Gateway) Configuration
+const TELEBIRR_MERCHANT_PHONE = process.env.TELEBIRR_PHONE || "09XXXXXXXX";
+const CBE_MERCHANT_ACCOUNT = process.env.CBE_ACCOUNT || "1000XXXXXXXXX";
+const MERCHANT_NAME = process.env.MERCHANT_NAME || "Merchant";
+const USDT_TO_ETB_RATE = parseFloat(process.env.USDT_TO_ETB_RATE || "130"); // 1 USDT = ~130 ETB
+
+// High-speed RPCs for Polygon and BSC BEP-20
+const POLYGON_RPC = process.env.POLYGON_RPC_URL || "https://polygon-bor-rpc.publicnode.com";
+const BSC_RPC = process.env.BSC_RPC_URL || "https://bsc-rpc.publicnode.com";
+const WATCHER_INTERVAL_MS = (parseInt(process.env.WATCHER_INTERVAL_SECONDS || "10", 10)) * 1000;
+
+// Official USDT Contract Addresses
+const POLYGON_USDT_CONTRACT = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"; // 6 decimals
+const BSC_USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955";     // 18 decimals
+const ERC20_ABI = ["function balanceOf(address owner) view returns (uint256)"];
+
+// Blockchain Providers
+const polygonProvider = new ethers.JsonRpcProvider(POLYGON_RPC);
+const bscProvider = new ethers.JsonRpcProvider(BSC_RPC);
+
 // File path for persistent storage
 const DATA_FILE = path.join(__dirname, 'accounts_data.json');
 
-// In-Memory Storage (with file persistence)
-const userAccounts = new Map(); // Telegram User ID -> User Account
-const invoices = new Map();     // Order ID -> Invoice
+// In-Memory Storage
+const userAccounts = new Map();     // User Index -> Account
+const verifiedReceipts = new Set(); // Prevent replay attacks on Telebirr/CBE receipts
 
-// Load saved accounts from file on startup
+// --- 1. Persistent Storage Engine ---
 function loadPersistedData() {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const raw = fs.readFileSync(DATA_FILE, 'utf-8');
       const data = JSON.parse(raw);
-      if (Array.isArray(data)) {
-        for (const user of data) {
+      if (data && Array.isArray(data.accounts)) {
+        for (const user of data.accounts) {
           userAccounts.set(user.userId, user);
         }
-        console.log(`💾 Loaded ${userAccounts.size} persistent accounts from disk.`);
       }
+      if (data && Array.isArray(data.receipts)) {
+        for (const r of data.receipts) {
+          verifiedReceipts.add(r);
+        }
+      }
+      console.log(`💾 Loaded ${userAccounts.size} accounts and ${verifiedReceipts.size} verified receipts.`);
     }
   } catch (err) {
     console.error('Data load note:', err.message);
   }
 }
 
-// Save accounts to file
 function savePersistedData() {
   try {
-    const list = Array.from(userAccounts.values());
-    fs.writeFileSync(DATA_FILE, JSON.stringify(list, null, 2), 'utf-8');
+    const payload = {
+      accounts: Array.from(userAccounts.values()),
+      receipts: Array.from(verifiedReceipts)
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (err) {
     console.error('Data save note:', err.message);
   }
 }
 
-// Initial load
 loadPersistedData();
-const PORT = process.env.PORT || 3000;
-const APP_URL = (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
-const MASTER_MNEMONIC = process.env.MASTER_MNEMONIC || "test test test test test test test test test test test junk";
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || "";
 
-const POLYGON_RPC = process.env.POLYGON_RPC_URL || "https://polygon-bor-rpc.publicnode.com";
-const BSC_RPC = process.env.BSC_RPC_URL || "https://bsc-dataseed.binance.org";
-const SOLANA_RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
-const TON_RPC = process.env.TON_API_URL || "https://toncenter.com/api/v2/jsonRPC";
-const TON_API_KEY = process.env.TON_API_KEY || "";
-const WATCHER_INTERVAL_MS = (parseInt(process.env.WATCHER_INTERVAL_SECONDS || "10", 10)) * 1000;
-
-// Token Contract Addresses (USDT)
-const POLYGON_USDT_CONTRACT = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"; // 6 decimals
-const BSC_USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955";     // 18 decimals
-const SOLANA_USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";     // 6 decimals
-
-// Blockchain Providers
-const polygonProvider = new ethers.JsonRpcProvider(POLYGON_RPC);
-const bscProvider = new ethers.JsonRpcProvider(BSC_RPC);
-const solanaConnection = new Connection(SOLANA_RPC, 'confirmed');
-const tonClient = new TonClient({ endpoint: TON_RPC, apiKey: TON_API_KEY });
-
-const ERC20_ABI = ["function balanceOf(address owner) view returns (uint256)"];
-
-// In-Memory Storage
-const userAccounts = new Map(); // Telegram User ID -> User Account
-const invoices = new Map();     // Order ID -> Invoice
-
-// --- 1. Address Derivation Engine (Unique Address per User / Order) ---
+// --- 2. Address Derivation Engine (Polygon & BEP-20) ---
 function getEvmAddress(orderIndex) {
   const cleanMnemonic = MASTER_MNEMONIC.trim().replace(/\s+/g, ' ');
   const wallet = ethers.HDNodeWallet.fromPhrase(
@@ -95,68 +96,35 @@ function getEvmAddress(orderIndex) {
   return wallet.address;
 }
 
-async function getSolanaAddress(orderIndex) {
-  const cleanMnemonic = MASTER_MNEMONIC.trim().replace(/\s+/g, ' ');
-  const seed = await bip39.mnemonicToSeed(cleanMnemonic);
-  const path = `m/44'/501'/${orderIndex}'/0'`;
-  const derived = derivePath(path, seed.toString('hex')).key;
-  const keypair = Keypair.fromSeed(derived);
-  return keypair.publicKey.toBase58();
-}
-
-async function getTonAddress(orderIndex) {
-  const cleanMnemonic = MASTER_MNEMONIC.trim().replace(/\s+/g, ' ');
-  const words = cleanMnemonic.split(' ');
-  const keyPair = await mnemonicToPrivateKey(words);
-  const wallet = WalletContractV4.create({
-    workchain: 0,
-    publicKey: keyPair.publicKey,
-    walletId: Number(orderIndex)
-  });
-  return wallet.address.toString({ bounceable: false });
-}
-
-// Get or create permanent unique deposit addresses for a Telegram User
-async function getOrCreateUserAccount(userId, username = 'User') {
+async function getOrCreateAccount(userId, name = 'Customer') {
   if (userAccounts.has(userId)) {
     return userAccounts.get(userId);
   }
+  const userIndex = userAccounts.size + 101;
+  const evmAddress = getEvmAddress(userIndex);
 
-  const userIndex = userAccounts.size + 101; // Sequential index starting at 101
-  const [polygonAddr, solanaAddr, tonAddr] = await Promise.all([
-    getEvmAddress(userIndex),
-    getSolanaAddress(userIndex),
-    getTonAddress(userIndex)
-  ]);
-
-  const userAccount = {
+  const account = {
     userId,
-    username,
+    name,
     userIndex,
-    createdAt: new Date(),
-    addresses: {
-      polygon: polygonAddr,
-      bep20: polygonAddr,
-      solana: solanaAddr,
-      ton: tonAddr
-    },
-    // Track last verified balances to detect ANY incoming amount
+    address: evmAddress, // Shared across Polygon & BSC
     lastBalances: {
-      polygon: 0,
-      bep20: 0,
-      solana: 0,
-      ton: 0
+      polygonUsdt: 0,
+      bep20Usdt: 0,
+      polygonPol: 0,
+      bscBnb: 0
     },
-    totalDeposited: 0,
+    totalDepositedUsd: 0,
+    totalDepositedEtb: 0,
     depositHistory: []
   };
 
-  userAccounts.set(userId, userAccount);
+  userAccounts.set(userId, account);
   savePersistedData();
-  return userAccount;
+  return account;
 }
 
-// --- 2. Balance Verification Engine (Without TxHash) ---
+// --- 3. Blockchain Balance Checkers ---
 async function checkPolygonUsdt(address) {
   try {
     const contract = new ethers.Contract(POLYGON_USDT_CONTRACT, ERC20_ABI, polygonProvider);
@@ -177,153 +145,184 @@ async function checkBscUsdt(address) {
   }
 }
 
-async function checkSolanaUsdt(address) {
+// --- 4. 🇪🇹 Ethiopian Birr Gateway (Telebirr & CBE Receipt Verifier) ---
+// Based on abrhamyalew/unified-receipt-verifier architecture
+async function verifyTelebirrReceipt(receiptIdOrUrl) {
+  let txId = receiptIdOrUrl.trim();
+  if (txId.includes('receipt/')) {
+    txId = txId.split('receipt/')[1].split('?')[0].split('/')[0];
+  }
+
+  if (verifiedReceipts.has(`TELEBIRR_${txId}`)) {
+    return { success: false, error: 'ይህ ደረሰኝ ቀደም ሲል ጥቅም ላይ ውሏል (Replay detected: Receipt already used)' };
+  }
+
+  const url = `https://transactioninfo.ethiotelecom.et/receipt/${txId}`;
   try {
-    const tokenAccounts = await solanaConnection.getParsedTokenAccountsByOwner(
-      new PublicKey(address),
-      { mint: new PublicKey(SOLANA_USDT_MINT) }
-    );
-    if (!tokenAccounts.value || tokenAccounts.value.length === 0) return 0;
-    const amount = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.uiAmount;
-    return amount || 0;
+    const res = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
+
+    const html = res.data || '';
+    if (!html || html.includes('not found') || html.includes('No record found')) {
+      return { success: false, error: 'ደረሰኙ በቴሌብር ሲስተም ላይ አልተገኘም (Receipt not found on Telebirr)' };
+    }
+
+    // Extract Amount (e.g., 1,500.00 ETB)
+    const amountMatch = html.match(/([\d,]+\.?\d*)\s*(?:ETB|Birr|ብር)/i) || html.match(/(?:Amount|መጠን)[\s\S]*?([\d,]+\.?\d*)/i);
+    const amount = amountMatch ? parseFloat(amountMatch[1].replace(/,/g, '')) : null;
+
+    // Check status
+    const isCompleted = html.includes('Completed') || html.includes('ተጠናቋል') || html.includes('Successful');
+
+    if (!isCompleted) {
+      return { success: false, error: 'ክፍያው ገና አልተጠናቀቀም (Transaction is not completed)' };
+    }
+
+    // Mark receipt as used
+    verifiedReceipts.add(`TELEBIRR_${txId}`);
+    savePersistedData();
+
+    return {
+      success: true,
+      provider: 'Telebirr',
+      txId,
+      amount,
+      rawUrl: url
+    };
   } catch (err) {
-    return 0;
+    return { success: false, error: `Telebirr Verification Error: ${err.message}` };
   }
 }
 
-async function checkTonBalance(address) {
+async function verifyCbeReceipt(receiptIdOrUrl) {
+  let txId = receiptIdOrUrl.trim();
+  if (txId.includes('id=')) {
+    txId = txId.split('id=')[1].split('&')[0];
+  }
+
+  if (verifiedReceipts.has(`CBE_${txId}`)) {
+    return { success: false, error: 'ይህ ደረሰኝ ቀደም ሲል ጥቅም ላይ ውሏል (Replay detected: Receipt already used)' };
+  }
+
+  const url = `https://apps.cbe.com.et:100/?id=${txId}`;
   try {
-    const balanceNano = await tonClient.getBalance(Address.parse(address));
-    return parseFloat(fromNano(balanceNano));
+    const res = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
+
+    const html = res.data || '';
+    const amountMatch = html.match(/([\d,]+\.?\d*)\s*(?:ETB|Birr)/i);
+    const amount = amountMatch ? parseFloat(amountMatch[1].replace(/,/g, '')) : null;
+
+    verifiedReceipts.add(`CBE_${txId}`);
+    savePersistedData();
+
+    return {
+      success: true,
+      provider: 'CBE',
+      txId,
+      amount,
+      rawUrl: url
+    };
   } catch (err) {
-    return 0;
+    return { success: false, error: `CBE Verification Error: ${err.message}` };
   }
 }
 
-// --- 3. Background Auto-Verifier (Checks Any Amount, Anytime) ---
+// On-Demand Blockchain Transaction Checker (Polygon / BSC)
+async function verifyBlockchainTx(txHash) {
+  const hash = txHash.trim();
+  
+  // 1. Check Polygon
+  try {
+    const receipt = await polygonProvider.getTransactionReceipt(hash);
+    if (receipt && receipt.status === 1) {
+      return {
+        success: true,
+        network: 'Polygon PoS',
+        blockNumber: receipt.blockNumber,
+        from: receipt.from,
+        to: receipt.to,
+        status: 'SUCCESS'
+      };
+    }
+  } catch (e) {}
+
+  // 2. Check BSC
+  try {
+    const receipt = await bscProvider.getTransactionReceipt(hash);
+    if (receipt && receipt.status === 1) {
+      return {
+        success: true,
+        network: 'BNB Smart Chain (BEP-20)',
+        blockNumber: receipt.blockNumber,
+        from: receipt.from,
+        to: receipt.to,
+        status: 'SUCCESS'
+      };
+    }
+  } catch (e) {}
+
+  return { success: false, error: 'ትራንዛክሽኑ በ Polygon ወይም BSC ላይ አልተገኘም (Failed or Pending)' };
+}
+
+// --- 5. Background Auto-Verifier (Checks Active Wallets) ---
 async function runAutoVerifier() {
-  // Check user permanent deposit addresses
-  for (const [userId, user] of userAccounts.entries()) {
+  for (const user of userAccounts.values()) {
     try {
-      const [polygonBal, bscBal, solanaBal, tonBal] = await Promise.all([
-        checkPolygonUsdt(user.addresses.polygon),
-        checkBscUsdt(user.addresses.bep20),
-        checkSolanaUsdt(user.addresses.solana),
-        checkTonBalance(user.addresses.ton)
+      const [polygonBal, bscBal] = await Promise.all([
+        checkPolygonUsdt(user.address),
+        checkBscUsdt(user.address)
       ]);
 
-      // Check Polygon USDT increase
-      if (polygonBal > user.lastBalances.polygon) {
-        const received = polygonBal - user.lastBalances.polygon;
-        user.lastBalances.polygon = polygonBal;
-        handleSuccessfulDeposit(user, received, 'Polygon (USDT)', user.addresses.polygon);
+      // Check Polygon USDT
+      if (polygonBal > user.lastBalances.polygonUsdt) {
+        const received = polygonBal - user.lastBalances.polygonUsdt;
+        user.lastBalances.polygonUsdt = polygonBal;
+        notifyDeposit(user, received, 'Polygon (USDT)');
       }
 
-      // Check BSC USDT increase
-      if (bscBal > user.lastBalances.bep20) {
-        const received = bscBal - user.lastBalances.bep20;
-        user.lastBalances.bep20 = bscBal;
-        handleSuccessfulDeposit(user, received, 'BSC BEP-20 (USDT)', user.addresses.bep20);
+      // Check BSC USDT
+      if (bscBal > user.lastBalances.bep20Usdt) {
+        const received = bscBal - user.lastBalances.bep20Usdt;
+        user.lastBalances.bep20Usdt = bscBal;
+        notifyDeposit(user, received, 'BNB Smart Chain BEP-20 (USDT)');
       }
-
-      // Check Solana USDT increase
-      if (solanaBal > user.lastBalances.solana) {
-        const received = solanaBal - user.lastBalances.solana;
-        user.lastBalances.solana = solanaBal;
-        handleSuccessfulDeposit(user, received, 'Solana (USDT)', user.addresses.solana);
-      }
-
-      // Check TON coin increase
-      if (tonBal > user.lastBalances.ton) {
-        const received = tonBal - user.lastBalances.ton;
-        user.lastBalances.ton = tonBal;
-        handleSuccessfulDeposit(user, received, 'TON (Coin)', user.addresses.ton);
-      }
-    } catch (e) {
-      // Quiet fail
-    }
-  }
-
-  // Also check standard web invoices
-  const now = new Date();
-  for (const [orderId, invoice] of invoices.entries()) {
-    if (invoice.status !== 'PENDING') continue;
-    if (now > invoice.expires_at) {
-      invoice.status = 'EXPIRED';
-      continue;
-    }
-    try {
-      const [polygonBalance, bscBalance, solanaBalance, tonBalance] = await Promise.all([
-        checkPolygonUsdt(invoice.addresses.polygon),
-        checkBscUsdt(invoice.addresses.bep20),
-        checkSolanaUsdt(invoice.addresses.solana),
-        checkTonBalance(invoice.addresses.ton)
-      ]);
-
-      let detectedNetwork = null;
-      let detectedAmount = 0;
-
-      if (polygonBalance >= invoice.amount_expected) {
-        detectedNetwork = 'Polygon (USDT)';
-        detectedAmount = polygonBalance;
-      } else if (bscBalance >= invoice.amount_expected) {
-        detectedNetwork = 'BSC BEP-20 (USDT)';
-        detectedAmount = bscBalance;
-      } else if (solanaBalance >= invoice.amount_expected) {
-        detectedNetwork = 'Solana (USDT)';
-        detectedAmount = solanaBalance;
-      } else if (tonBalance >= invoice.amount_expected) {
-        detectedNetwork = 'TON (Coin)';
-        detectedAmount = tonBalance;
-      }
-
-      if (detectedNetwork) {
-        invoice.status = 'PAID';
-        invoice.paid_at = new Date();
-        invoice.paid_network = detectedNetwork;
-        invoice.paid_amount = detectedAmount;
-      }
-    } catch (err) {}
+    } catch (e) {}
   }
 }
 
-// Action when ANY payment arrives at any time
-function handleSuccessfulDeposit(user, amount, network, address) {
-  user.totalDeposited += amount;
+function notifyDeposit(user, amount, network) {
+  user.totalDepositedUsd += amount;
   user.depositHistory.push({
     amount,
+    currency: 'USDT',
     network,
     time: new Date(),
-    address
+    address: user.address
   });
   savePersistedData();
 
-  console.log(`🎉 [Payment Verified] User ${user.username} (${user.userId}) sent $${amount} on ${network}!`);
+  console.log(`✅ [Payment Detected] User ${user.name} deposited $${amount} on ${network}!`);
 
-  // 1. Notify the Customer in Telegram
-  if (bot && user.userId) {
-    const userMsg = `🎉 **ክፍያዎ ደርሷል! (Payment Received)**\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
+  // Alert Admin on Telegram
+  if (bot && TELEGRAM_ADMIN_CHAT_ID) {
+    const adminMsg = `🎉 **አዲስ ክፍያ ተረጋግጧል! (Payment Verified)**\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 **ደንበኛ/ተጠቃሚ:** \`${user.name}\` (ID: \`${user.userId}\`)\n` +
       `💰 **የተከፈለ መጠን:** \`$${amount.toFixed(2)} USDT\`\n` +
       `🌐 **ኔትወርክ:** \`${network}\`\n` +
+      `📍 **አድራሻ:** \`${user.address}\`\n` +
       `⏱️ **ሰዓት:** \`${new Date().toLocaleTimeString()}\`\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `✅ *ክፍያዎ ያለ ምንም hash በራስ-ሰር ተረጋግጦ ወደ ሂሳብዎ ገብቷል! እናመሰግናለን።*`;
-
-    bot.sendMessage(user.userId, userMsg, { parse_mode: 'Markdown' }).catch(() => {});
-  }
-
-  // 2. Notify the Admin in Telegram
-  if (bot && TELEGRAM_ADMIN_CHAT_ID) {
-    const adminMsg = `💰 **አዲስ ክፍያ ደርሷል! (Deposit Alert)**\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `👤 **ተጠቃሚ:** @${user.username || 'ያልታወቀ'} (ID: \`${user.userId}\`)\n` +
-      `💵 **መጠን:** \`$${amount.toFixed(2)} USDT\`\n` +
-      `🌐 **ኔትወርክ:** \`${network}\`\n` +
-      `📍 **የገባበት አድራሻ:** \`${address}\`\n` +
-      `⏱️ **ሰዓት:** \`${new Date().toLocaleTimeString()}\`\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `✅ *ገንዘቡ በቀጥታ ወደ እርስዎ Trust Wallet ገብቷል!*`;
+      `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ *ያለ ምንም TxHash በራስ-ሰር ተረጋግጧል! ገንዘቡ በቀጥታ ዋሌትዎ ገብቷል!*`;
 
     bot.sendMessage(TELEGRAM_ADMIN_CHAT_ID, adminMsg, { parse_mode: 'Markdown' }).catch(() => {});
   }
@@ -331,184 +330,295 @@ function handleSuccessfulDeposit(user, amount, network, address) {
 
 setInterval(runAutoVerifier, WATCHER_INTERVAL_MS);
 
-// --- 4. 🤖 Telegram Bot (Direct In-Chat Deposit Engine) ---
+// --- 6. 🌐 HTTP Routes (Cronjob Keep-Alive & APIs) ---
+
+// 1. CRONJOB / KEEP-ALIVE ENDPOINTS (Returns HTTP 200 OK)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: new Date() });
+});
+
+app.get('/ping', (req, res) => {
+  res.status(200).json({ status: 'ok', message: 'Pong! 200 OK for Cronjob', timestamp: new Date() });
+});
+
+app.get('/cron', (req, res) => {
+  res.status(200).json({ status: 'ok', message: 'Cronjob trigger active', timestamp: new Date() });
+});
+
+// 2. REST API: Create Invoice / Generate Address
+app.post('/api/invoice/create', async (req, res) => {
+  try {
+    const { order_id, amount_usd, customer_name } = req.body;
+    const account = await getOrCreateAccount(order_id || Date.now(), customer_name || 'Web Customer');
+    const amountUsd = parseFloat(amount_usd || 10);
+    const amountEtb = amountUsd * USDT_TO_ETB_RATE;
+
+    res.json({
+      success: true,
+      data: {
+        order_id: account.userId,
+        amount_usd: amountUsd,
+        amount_etb: amountEtb,
+        crypto: {
+          address: account.address,
+          networks: ['Polygon (USDT)', 'BNB Smart Chain BEP-20 (USDT)']
+        },
+        local_banks: {
+          telebirr: { phone: TELEBIRR_MERCHANT_PHONE, name: MERCHANT_NAME },
+          cbe: { account: CBE_MERCHANT_ACCOUNT, name: MERCHANT_NAME }
+        }
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. REST API: Verify Local Receipt (Telebirr / CBE)
+app.post('/api/verify-receipt', async (req, res) => {
+  const { provider, receipt } = req.body;
+  if (!receipt) return res.status(400).json({ error: 'Receipt or TxID required' });
+
+  let result;
+  if (provider === 'cbe') {
+    result = await verifyCbeReceipt(receipt);
+  } else {
+    result = await verifyTelebirrReceipt(receipt);
+  }
+
+  res.json(result);
+});
+
+// Home Page Dashboard
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <head><title>Payment Gateway</title></head>
+      <body style="font-family: sans-serif; padding: 40px; text-align: center; line-height: 1.6;">
+        <h2>⚡ Unified Crypto & Birr Payment Gateway</h2>
+        <p>Status: <b style="color: green;">200 OK - RUNNING</b></p>
+        <p>Supported: <b>Polygon (USDT)</b> &bull; <b>BEP-20 BSC (USDT)</b> &bull; <b>Telebirr</b> &bull; <b>CBE</b></p>
+        <p>Cronjob URL: <code>${APP_URL}/ping</code></p>
+      </body>
+    </html>
+  `);
+});
+
+// --- 7. 🤖 Admin-Only Telegram Bot with Sleek UI ---
 let bot = null;
 
 if (TELEGRAM_BOT_TOKEN) {
   try {
     bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-    console.log("🤖 Telegram Payment Bot initialized!");
+    console.log("🤖 Admin Telegram Bot running!");
 
     bot.on('polling_error', (error) => {
       console.log('Telegram note:', error.code || error.message);
     });
 
-    const userKeyboard = {
+    // Admin Verification Guard
+    function isAdmin(chatId) {
+      if (!TELEGRAM_ADMIN_CHAT_ID) return true;
+      return String(chatId) === String(TELEGRAM_ADMIN_CHAT_ID).trim();
+    }
+
+    // Modern Admin Keyboard
+    const adminKeyboard = {
       reply_markup: {
         keyboard: [
-          [{ text: '💳 የክፍያ አድራሻ አውጣ (Deposit)' }],
-          [{ text: '💰 የኔ ሂሳብ (My Balance)' }, { text: 'ℹ️ መመሪያ (Help)' }]
+          [{ text: '➕ አዲስ ደረሰኝ (New Invoice)' }, { text: '🔍 ትራንዛክሽን ፈትሽ (Check Tx)' }],
+          [{ text: '🔄 Rescan (አድራሻዎችን ፈትሽ)' }, { text: '📊 የክፍያዎች ሪፖርት (Stats)' }],
+          [{ text: '⚡ የሲስተም ሁኔታ (Ping / Health)' }]
         ],
         resize_keyboard: true
       }
     };
 
     // /start command
-    bot.onText(/\/start/, async (msg) => {
+    bot.onText(/\/start/, (msg) => {
       const chatId = msg.chat.id;
-      const username = msg.from.username || msg.from.first_name || 'User';
 
-      // Pre-generate addresses for this user
-      await getOrCreateUserAccount(chatId, username);
+      if (!isAdmin(chatId)) {
+        return bot.sendMessage(chatId, `⛔ **ይቅርታ! ይህ ቦት ለአስተዳዳሪ (Admin) ብቻ የተዘጋጀ ነው።**`, { parse_mode: 'Markdown' });
+      }
 
-      const welcome = `👋 ሰላም ${username}፣ እንኳን ወደ ክሪፕቶ ክፍያ ቦት በደህና መጡ!\n\n` +
-        `እዚህ ቦት ላይ **የፈለጉትን የገንዘብ መጠን በፈለጉት ሰዓት** መላክ ይችላሉ።\n\n` +
-        `📌 **ዋና ዋና ጥቅሞች፡**\n` +
-        `• ምንም አይነት ድረ-ገጽ ወይም ሊንክ መክፈት አያስፈልግዎትም!\n` +
-        `• የግብይት ቁጥር (Tx Hash) መላክ አይጠበቅብዎትም፤ በራሱ ያረጋግጣል።\n` +
-        `• በ **Solana, Polygon, BEP-20 (BSC), እና TON** መቀበል ይችላሉ።\n\n` +
-        `የመክፈያ አድራሻዎን ለማግኘት ከታች ያለውን **"💳 የክፍያ አድራሻ አውጣ (Deposit)"** የሚለውን አዝራር ይጫኑ።`;
+      const welcome = `⚡ **CRYPTO & BIRR PAYMENT GATEWAY** ⚡\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `👑 **የአስተዳዳሪ መቆጣጠሪያ ፓነል (Admin Panel)**\n\n` +
+        `🔹 **ክሪፕቶ ኔትወርኮች፡** Polygon (USDT) • BEP-20 BSC (USDT)\n` +
+        `🔹 **የሀገር ውስጥ ባንኮች፡** Telebirr • CBE Birr\n` +
+        `🔹 **የሰርቨር ሁኔታ፡** 🟢 \`200 OK (Active)\`\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `ከታች ካሉት አዝራሮች አንዱን ይምረጡ፡`;
 
-      bot.sendMessage(chatId, welcome, userKeyboard);
+      bot.sendMessage(chatId, welcome, adminKeyboard);
     });
 
-    // Handle button clicks and text
+    // Handle button actions
     bot.on('message', async (msg) => {
       const chatId = msg.chat.id;
       const text = msg.text || '';
-      const username = msg.from.username || msg.from.first_name || 'User';
 
-      if (text.startsWith('/start') || text.startsWith('/stats')) return;
+      if (!isAdmin(chatId)) return;
+      if (text.startsWith('/start') || text.startsWith('/check') || text.startsWith('/new')) return;
 
-      if (text === '💳 የክፍያ አድራሻ አውጣ (Deposit)' || text === '/deposit' || text === '/pay') {
-        await sendDepositAddresses(chatId, username);
-      } else if (text === '💰 የኔ ሂሳብ (My Balance)' || text === '/balance') {
-        const user = await getOrCreateUserAccount(chatId, username);
-        const reply = `💰 **የእርስዎ የክፍያ ሂሳብ (Balance)**\n` +
-          `━━━━━━━━━━━━━━━━━━━━\n` +
-          `💵 **አጠቃላይ የከፈሉት መጠን:** \`$${user.totalDeposited.toFixed(2)} USDT\`\n` +
-          `📦 **የክፍያዎች ብዛት:** ${user.depositHistory.length}\n` +
-          `━━━━━━━━━━━━━━━━━━━━\n` +
-          `አዲስ ክፍያ ለመላክ "💳 የክፍያ አድራሻ አውጣ" የሚለውን ይጫኑ።`;
-        bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
-      } else if (text === 'ℹ️ መመሪያ (Help)' || text === '/help') {
-        const help = `ℹ️ **ክፍያ እንዴት እንደሚፈጽሙ፡**\n\n` +
-          `1. "💳 የክፍያ አድራሻ አውጣ" የሚለውን ይጫኑ።\n` +
-          `2. የሚመጣውን አድራሻ በመንካት ኮፒ ያድርጉ (Tap to Copy)።\n` +
-          `3. ከዋሌትዎ (Binance, Bybit, Trust Wallet...) የፈለጉትን መጠን ይላኩ።\n` +
-          `4. ገንዘቡ እንደደረሰ ቦቱ በሰከንዶች ውስጥ "ክፍያዎ ደርሷል" የሚል ማረጋገጫ ይልክልዎታል። ምንም Hash መላክ አያስፈልግም!`;
-        bot.sendMessage(chatId, help);
+      if (text === '➕ አዲስ ደረሰኝ (New Invoice)') {
+        await handleCreateInvoicePrompt(chatId);
+      } else if (text === '🔍 ትራንዛክሽን ፈትሽ (Check Tx)') {
+        bot.sendMessage(chatId, `🔍 **ትራንዛክሽን ወይም ደረሰኝ ለመፈተሽ፡**\n\n` +
+          `• የብሎክቼይን Hash ከሆነ፡ \`/check 0x...\`\n` +
+          `• የቴሌብር ደረሰኝ ከሆነ፡ \`/check DB1234567\` ወይም ሊንኩን\n` +
+          `• የ CBE ደረሰኝ ከሆነ፡ \`/check CBE_ID\`\n\n` +
+          `ብለው ይላኩ። ሲስተሙ ወዲያውኑ አረጋግጦ ውጤቱን ያሳውቅዎታል።`, { parse_mode: 'Markdown' });
+      } else if (text === '🔄 Rescan (አድራሻዎችን ፈትሽ)') {
+        bot.sendMessage(chatId, `🔄 **ሁሉንም አድራሻዎች በብሎክቼይን ላይ በመፈተሽ ላይ...**`);
+        await runAutoVerifier();
+        bot.sendMessage(chatId, `✅ **የአድራሻዎች ፍተሻ ተጠናቋል!** ሁሉም የገቡ ክፍያዎች ተረጋግጠዋል።`);
+      } else if (text === '📊 የክፍያዎች ሪፖርት (Stats)') {
+        handleStatsReport(chatId);
+      } else if (text === '⚡ የሲስተም ሁኔታ (Ping / Health)') {
+        const uptimeMin = (process.uptime() / 60).toFixed(1);
+        bot.sendMessage(chatId, `🟢 **SYSTEM HEALTH: 200 OK**\n\n` +
+          `📡 **Render Uptime:** \`${uptimeMin} ደቂቃዎች\`\n` +
+          `🌐 **Cronjob Ping URL:** \`${APP_URL}/ping\`\n` +
+          `👥 **ጠቅላላ አድራሻዎች:** \`${userAccounts.size}\`\n` +
+          `🧾 **የተረጋገጡ ደረሰኞች:** \`${verifiedReceipts.size}\``, { parse_mode: 'Markdown' });
       }
     });
 
-    // Send Deposit Addresses DIRECTLY in Telegram (No external link!)
-    async function sendDepositAddresses(chatId, username) {
-      const user = await getOrCreateUserAccount(chatId, username);
+    // /new <amount> command
+    bot.onText(/\/new\s*(\d+(\.\d+)?)/, async (msg, match) => {
+      if (!isAdmin(msg.chat.id)) return;
+      const amount = parseFloat(match[1]);
+      await handleCreateInvoiceCard(msg.chat.id, amount);
+    });
 
-      const msg = `💳 **የእርስዎ ቋሚ የክፍያ አድራሻዎች (Deposit Addresses)**\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `📌 *የፈለጉትን መጠን በፈለጉት ሰዓት መላክ ይችላሉ። ክፍያው ሲገባ በሰከንዶች ውስጥ በራሱ ያረጋግጣል (ያለ Hash)*\n\n` +
-        `🟣 **Polygon (USDT / POL):**\n` +
-        `\`${user.addresses.polygon}\`\n` +
-        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n\n` +
-        `🟡 **BNB Smart Chain BEP-20 (USDT):**\n` +
-        `\`${user.addresses.bep20}\`\n` +
-        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n\n` +
-        `🟣 **Solana (USDT / SOL):**\n` +
-        `\`${user.addresses.solana}\`\n` +
-        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n\n` +
-        `💎 **TON (TON Coin):**\n` +
-        `\`${user.addresses.ton}\`\n` +
-        `*(ለመገልበጥ አድራሻውን ይጫኑ)*\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `⚡ *ክፍያዎ እንደደረሰ ወዲያውኑ ማሳወቂያ ይደርስዎታል!*`;
+    // /check <tx_or_receipt> command (On-demand verification tool!)
+    bot.onText(/\/check\s+(.+)/, async (msg, match) => {
+      if (!isAdmin(msg.chat.id)) return;
+      const query = match[1].trim();
+      const chatId = msg.chat.id;
 
-      bot.sendMessage(chatId, msg, {
+      bot.sendMessage(chatId, `⏳ **ትራንዛክሽኑን በማጣራት ላይ...**`);
+
+      // 1. If it's a Blockchain Hash (0x...)
+      if (query.startsWith('0x') && query.length === 66) {
+        const result = await verifyBlockchainTx(query);
+        if (result.success) {
+          const reply = `✅ **ብሎክቼይን ትራንዛክሽን ተረጋግጧል!**\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `🌐 **ኔትወርክ:** \`${result.network}\`\n` +
+            `📦 **Block:** \`#${result.blockNumber}\`\n` +
+            `📍 **ተቀባይ አድራሻ:** \`${result.to}\`\n` +
+            `⏱️ **ሁኔታ:** **${result.status}**\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `ክፍያው በብሎክቼይኑ ላይ በተሳካ ሁኔታ ገቢ ሆኗል!`;
+          return bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+        } else {
+          return bot.sendMessage(chatId, `❌ ${result.error}`);
+        }
+      }
+
+      // 2. If it's Telebirr
+      if (query.toUpperCase().startsWith('DB') || query.includes('ethiotelecom.et')) {
+        const result = await verifyTelebirrReceipt(query);
+        if (result.success) {
+          const reply = `✅ **የቴሌብር ደረሰኝ ተረጋግጧል!**\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `🧾 **Transaction ID:** \`${result.txId}\`\n` +
+            `💵 **የተከፈለ መጠን:** \`${result.amount} ETB\`\n` +
+            `📱 **ፕሮቫይደር:** \`Telebirr\`\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `ክፍያው ህጋዊና ትክክለኛ መሆኑ ተረጋግጧል!`;
+          return bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+        } else {
+          return bot.sendMessage(chatId, `❌ ${result.error}`);
+        }
+      }
+
+      // 3. Fallback check for CBE
+      const cbeResult = await verifyCbeReceipt(query);
+      if (cbeResult.success) {
+        const reply = `✅ **የ CBE ደረሰኝ ተረጋግጧል!**\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🧾 **Transaction ID:** \`${cbeResult.txId}\`\n` +
+          `💵 **የተከፈለ መጠን:** \`${cbeResult.amount || 'ያልታወቀ'} ETB\`\n` +
+          `🏦 **ባንክ:** \`Commercial Bank of Ethiopia\`\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━━━`;
+        return bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+      }
+
+      bot.sendMessage(chatId, `❌ ማስገቢያው አልታወቀም። እባክዎ ትክክለኛ የብሎክቼይን TxHash (0x...) ወይም የቴሌብር/CBE የደረሰኝ ቁጥር ያስገቡ።`);
+    });
+
+    async function handleCreateInvoicePrompt(chatId) {
+      await handleCreateInvoiceCard(chatId, 10.0);
+    }
+
+    async function handleCreateInvoiceCard(chatId, amountUsd) {
+      const orderId = Math.floor(1000 + Math.random() * 90000);
+      const account = await getOrCreateAccount(orderId, `Order #${orderId}`);
+      const amountEtb = (amountUsd * USDT_TO_ETB_RATE).toFixed(2);
+
+      const invoiceCard = `💳 **የክፍያ ደረሰኝ (Invoice #${orderId})**\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `💵 **መጠን በዶላር:** \`$${amountUsd.toFixed(2)} USDT\`\n` +
+        `🇪🇹 **መጠን በብር:** \`${amountEtb} ETB\`\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🌐 **1. ክሪፕቶ (Polygon ወይም BEP-20 USDT):**\n` +
+        `\`${account.address}\`\n` +
+        `*(አድራሻውን ነክተው ኮፒ ያድርጉ - Tap to Copy)*\n\n` +
+        `📱 **2. በቴሌብር (Telebirr):**\n` +
+        `• ስልክ ቁጥር፡ \`${TELEBIRR_MERCHANT_PHONE}\`\n` +
+        `• ስም፡ \`${MERCHANT_NAME}\`\n\n` +
+        `🏦 **3. በኢትዮጵያ ንግድ ባንክ (CBE):**\n` +
+        `• ሂሳብ ቁጥር፡ \`${CBE_MERCHANT_ACCOUNT}\`\n` +
+        `• ስም፡ \`${MERCHANT_NAME}\`\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `⚡ *ይህንን መልዕክት ለደንበኛዎ ይላኩ። በክሪፕቶ ሲከፍሉ በራሱ ያረጋግጣል፤ በባንክ ከከፈሉ ደረሰኙን በ /check ያረጋግጡ!*`;
+
+      bot.sendMessage(chatId, invoiceCard, {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
             [
-              { text: '📷 Polygon QR', callback_data: `qr_polygon_${chatId}` },
-              { text: '📷 Solana QR', callback_data: `qr_solana_${chatId}` }
-            ],
-            [
-              { text: '📷 BSC QR', callback_data: `qr_bep20_${chatId}` },
-              { text: '📷 TON QR', callback_data: `qr_ton_${chatId}` }
+              { text: '📷 Polygon/BSC QR Code', url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(account.address)}` }
             ]
           ]
         }
       });
     }
 
-    // QR Code callbacks
-    bot.on('callback_query', async (query) => {
-      const data = query.data;
-      const chatId = query.message.chat.id;
-
-      if (data.startsWith('qr_')) {
-        const parts = data.split('_');
-        const net = parts[1];
-        const user = userAccounts.get(chatId);
-
-        if (user && user.addresses[net]) {
-          const addr = user.addresses[net];
-          const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(addr)}`;
-
-          bot.sendPhoto(chatId, qrUrl, {
-            caption: `📷 **${net.toUpperCase()} Deposit QR Code**\n\n\`${addr}\`\n\n*(ይህንን ስካን በማድረግ የፈለጉትን መጠን ይላኩ)*`,
-            parse_mode: 'Markdown'
-          });
-        }
-      }
-      bot.answerCallbackQuery(query.id);
-    });
-
-    // Admin /stats command
-    bot.onText(/\/stats/, (msg) => {
-      if (String(msg.chat.id) !== String(TELEGRAM_ADMIN_CHAT_ID)) return;
-
-      let totalCollected = 0;
-      let totalTxCount = 0;
+    function handleStatsReport(chatId) {
+      let totalUsd = 0;
+      let totalTx = 0;
 
       for (const u of userAccounts.values()) {
-        totalCollected += u.totalDeposited;
-        totalTxCount += u.depositHistory.length;
+        totalUsd += u.totalDepositedUsd;
+        totalTx += u.depositHistory.length;
       }
 
-      const report = `📊 **የአድሚን አጠቃላይ ሪፖርት (Stats)**\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `👥 **ጠቅላላ ተጠቃሚዎች:** ${userAccounts.size}\n` +
-        `✅ **የተሳኩ ክፍያዎች ብዛት:** ${totalTxCount}\n` +
-        `💰 **አጠቃላይ ገቢ:** \`$${totalCollected.toFixed(2)} USDT\`\n` +
-        `━━━━━━━━━━━━━━━━━━━━`;
+      const report = `📊 **የአድሚን የክፍያዎች ሪፖርት (Stats)**\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `💰 **ጠቅላላ ክሪፕቶ ገቢ:** \`$${totalUsd.toFixed(2)} USDT\`\n` +
+        `🧾 **የተሳኩ ክፍያዎች ብዛት:** \`${totalTx}\`\n` +
+        `👥 **የተፈጠሩ አድራሻዎች:** \`${userAccounts.size}\`\n` +
+        `🇪🇹 **የተረጋገጡ የሀገር ውስጥ ደረሰኞች:** \`${verifiedReceipts.size}\`\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
-      bot.sendMessage(msg.chat.id, report, { parse_mode: 'Markdown' });
-    });
+      bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+    }
 
   } catch (err) {
-    console.error("Bot error:", err.message);
+    console.error("Bot setup error:", err.message);
   }
 }
 
-// --- 5. Web Service Routes (Health check & optional dashboard) ---
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', users: userAccounts.size, time: new Date() });
-});
-
-app.get('/', (req, res) => {
-  res.send(`
-    <html>
-      <body style="font-family: sans-serif; padding: 40px; text-align: center;">
-        <h2>⚡ Telegram Crypto Payment Auto-Verifier</h2>
-        <p>Status: <b style="color: green;">ACTIVE</b></p>
-        <p>Active Users: <b>${userAccounts.size}</b></p>
-        <p>Connect with the bot directly on Telegram!</p>
-      </body>
-    </html>
-  `);
-});
-
 // Start Server
 app.listen(PORT, () => {
-  console.log(`🚀 Crypto Verifier started on port ${PORT}`);
+  console.log(`=======================================================`);
+  console.log(`🔥 Unified Crypto (BEP20/Polygon) & Local Bank Gateway`);
+  console.log(`📡 Port: ${PORT}`);
+  console.log(`⏱️ Cron Keep-Alive URL: ${APP_URL}/ping (Returns 200 OK)`);
+  console.log(`=======================================================`);
 });
